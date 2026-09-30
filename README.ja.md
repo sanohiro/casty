@@ -144,7 +144,7 @@ casty   # ホームページを開く
 | `headlessShellPath` | 外部の standalone headless shell の実行ファイル | 空（自動取得版） |
 | `searchUrl` | 検索エンジン URL | `https://www.google.com/search?q=` |
 | `transport` | 画像転送方式: `auto`, `file`, `inline` | `auto` (bcon/kitty→file、他→inline) |
-| `format` | キャプチャ形式: `auto`, `png`, `jpeg` | `auto` (file→jpeg adaptive、inline→png) |
+| `format` | キャプチャ形式: `auto`, `png`, `jpeg`（JPEG は bcon の file 転送のみ。他は PNG） | `auto` (bcon の file→jpeg adaptive、他→png) |
 | `mouseMode` | `1002` (ボタンイベント) or `1003` (全イベント) | `1003` (ホバー有効) |
 | `media` | WebRTC 用カメラ/マイク有効化（実験的、`ffmpeg` 必要） | `false` |
 
@@ -169,7 +169,7 @@ Ghostty ではピクセル単位のマウス座標を使い、拡大時のホバ
 - `Runtime.enable` は絶対に送らない（Google ログインが壊れる。これは苦労して発見した）
 - ステルスパッチは `Page.addScriptToEvaluateOnNewDocument` でページロード前に注入
 - フレーム取得はハイブリッド方式: 低解像度 Screencast で変更を検知して、`Page.captureScreenshot` で DPR 対応の高解像度フレームを取得
-- ファイル転送モードでは JPEG→PNG のアダプティブ切替: スクロール中や動画再生中は高速な JPEG、止まったら鮮明な PNG
+- bcon のファイル転送では JPEG→PNG のアダプティブ切替: スクロール中や動画再生中は高速な JPEG、止まったら鮮明な PNG
 - CSI 14t でターミナルのピクセルサイズを取得して自動ズーム
 
 ```
@@ -190,6 +190,18 @@ lib/bookmarks.js   ブックマーク検索
 </details>
 
 ## トラブルシューティング
+
+### ARM64 Linux で動画を読み込めない
+
+対応する動画・音声形式は headless-shell のビルドによって異なります。一部の ARM64 Linux 版は、AV1／VP9 動画や Opus 音声には対応していても、H.264 動画や AAC 音声には対応していません。動画が読み込めない、長さが 0 秒と表示される場合は、この制限が関係している可能性があります。端末への画像転送形式を変更してもコーデックは追加されません。
+
+ソースコードを取得している場合は、問題のページを casty で開いたまま、同じユーザーの別端末から診断できます。
+
+```bash
+node scripts/diagnose-playback.mjs
+```
+
+ブラウザのバージョン、対応形式、再生エラー、再生状態、Linux の音声出力情報が `.local-logs/playback-*.json` に保存されます。既存のセッションを調べるだけで、ページの移動は行いません。
 
 ### YouTube で音が出ない（Ubuntu Server）
 

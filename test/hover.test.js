@@ -263,6 +263,15 @@ async function runHoverTrial() {
       assert.ok(Math.abs((await evaluate('scrollY')) - 100) < 2, 'capture must preserve scroll position');
       pointer(64, 400, 400);
       await waitFor(async () => (await evaluate('wheels.length')) === 2 && (await evaluate('scrollY')) < 2, 'wheel up must return to the original position');
+      // Fractional compositor scales must not move a resting scrolled viewport.
+      await evaluate('scrollTo(0,1234.5)');
+      await delay(200);
+      const restingScroll = await evaluate('scrollY');
+      for (let repeat = 0; repeat < 8; repeat++) {
+        await capture.forceCapture();
+        await delay(30);
+        assert.ok(Math.abs((await evaluate('scrollY')) - restingScroll) < 0.1, `capture moved resting scroll at zoom ${zoom}`);
+      }
       await evaluate('document.body.style.height="";scrollTo(0,0)');
       await capture.forceCapture();
       process.stderr.write(`pointer passed: zoom=${zoom}, hover without clicks, click target, drag selection, wheel scrolling\n`);

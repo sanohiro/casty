@@ -295,3 +295,130 @@ test('native motion reports update hover without inventing button presses', () =
     timeout: 5000, stdio: 'pipe', env: { ...process.env, TERM_PROGRAM: 'ghostty', TMUX: '' },
   });
 });
+
+for (const terminal of ['ghostty', 'kitty']) {
+  test(`trackpad bursts stay bounded and preserve keys and button releases (${terminal})`, () => {
+    const source = `
+      import assert from 'node:assert/strict';
+      import { EventEmitter } from 'node:events';
+      import { setImmediate as turn, setTimeout as delay } from 'node:timers/promises';
+      import { startInputHandling } from ${JSON.stringify(new URL('../lib/input.js', import.meta.url).href)};
+      process.stdout.write = () => true;
+      process.stdin.setRawMode = () => {};
+      const client = new EventEmitter(), events = [];
+      let blockedType = 'mouseWheel', release;
+      client.send = async (method, params) => {
+        if (method === 'Page.getNavigationHistory') return { entries: [], currentIndex: 0 };
+        events.push({ method, ...params });
+        if (params?.type === blockedType) {
+          blockedType = null;
+          await new Promise(r => release = r);
+        }
+        return {};
+      };
+      startInputHandling(client, 10, 20, 1.25, {'ctrl+q': 'quit'}, () => {}, () => {});
+      const input = str => process.stdin.emit('data', Buffer.from(str));
+      const down = '\\x1b[<65;30;30M', up = '\\x1b[<64;30;30M';
+      input(down);
+      await turn();
+      for (let i = 0; i < 1000; i++) input(down + '\\x1b[<35;31;31M');
+      input(up + 'hello' + '\\x1b[<0;30;30M\\x1b[<32;31;30M\\x1b[<0;31;30m');
+      release();
+      await turn();
+      const wheels = events.filter(e => e.type === 'mouseWheel');
+      assert.equal(wheels.length, 2, 'a blocked wheel must retain only one pending wheel');
+      assert.equal(wheels.at(-1).deltaY, -100, 'reversing direction must replace pending forward scroll');
+      assert.deepEqual(events.filter(e => e.type === 'mousePressed' || e.type === 'mouseReleased').map(e => e.type), ['mousePressed', 'mouseReleased']);
+      assert.deepEqual(events.filter(e => e.method === 'Input.insertText').map(e => e.text), ['hello']);
+      const textIndex = events.findIndex(e => e.method === 'Input.insertText');
+      assert.ok(textIndex < events.findIndex(e => e.type === 'mousePressed'));
+
+      // Reports that age behind a stalled press are discarded, but release survives.
+      blockedType = 'mousePressed';
+      input('\\x1b[<0;30;30M');
+      await turn();
+      input(down.repeat(100));
+      input('\\x1b[<0;30;30m');
+      await delay(180);
+      release();
+      await turn();
+      assert.equal(events.filter(e => e.type === 'mouseWheel').length, 2);
+      assert.equal(events.at(-1).type, 'mouseReleased');
+
+      // A quit key batched with a trackpad burst bypasses the blocked CDP command.
+      blockedType = 'mouseWheel';
+      input(down);
+      await turn();
+      let quit = false;
+      process.on('SIGINT', () => quit = true);
+      input(down.repeat(1000) + '\\x11');
+      assert.equal(quit, true, 'quit must not wait for Chrome');
+      release();
+      process.exit(0);
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+      timeout: 5000, stdio: 'pipe', env: { ...process.env, TERM_PROGRAM: terminal, TMUX: '' },
+    });
+  });
+}
+
+for (const terminal of ['ghostty', 'kitty']) {
+  test(`outside-grid clicks cannot trap input in address editing (${terminal})`, () => {
+    const source = `
+      import assert from 'node:assert/strict';
+      import { EventEmitter } from 'node:events';
+      import { setImmediate as turn, setTimeout as delay } from 'node:timers/promises';
+      import { startInputHandling } from ${JSON.stringify(new URL('../lib/input.js', import.meta.url).href)};
+      process.stdout.write = () => true;
+      process.stdin.setRawMode = () => {};
+      const client = new EventEmitter(), events = [], pauses = [];
+      client.send = async (method, params) => {
+        if (method === 'Page.getNavigationHistory') return { entries: [], currentIndex: 0 };
+        events.push({ method, ...params });
+        return {};
+      };
+      let captures = 0;
+      const bar = startInputHandling(client, 16, 34, 2, {'alt+l':'url_bar'}, p => pauses.push(p), () => captures++);
+      const input = str => process.stdin.emit('data', Buffer.from(str));
+      // Replay the click that entered editing in the real Ghostty freeze trace.
+      input('\\x1b[<35;525;-2M\\x1b[<35;525;-1M\\x1b[<0;525;-1M\\x1b[<0;525;-1m');
+      await turn();
+      assert.equal(bar.editing, false, 'a click above the terminal must not open its address bar');
+      input('\\x1b[<0;-1;1M\\x1b[<0;-1;1m');
+      await turn();
+      assert.equal(bar.editing, false, 'a click left of the terminal must not open its address bar');
+      assert.deepEqual(pauses, []);
+      input('\\x1b[<0;525;254M\\x1b[<0;525;254m');
+      await turn();
+      assert.equal(events.at(-1).type, 'mouseReleased');
+
+      // A legitimate address-bar click can be dismissed by clicking the page.
+      input('\\x1b[<0;25;1M\\x1b[<0;25;1m');
+      await turn();
+      assert.equal(bar.editing, true);
+      const presses = events.filter(e => e.type === 'mousePressed').length;
+      input('\\x1b[<0;25;100M\\x1b[<0;25;100m');
+      await turn();
+      assert.equal(bar.editing, false);
+      assert.equal(pauses.at(-1), false);
+      assert.equal(events.filter(e => e.type === 'mousePressed').length, presses + 1);
+      assert.equal(events.at(-1).type, 'mouseReleased');
+      assert.equal(events.filter(e => e.method === 'Page.navigate').length, 0);
+
+      // Escape also resumes rendering, even if the page itself has not changed.
+      input('\\x1bl');
+      await turn();
+      assert.equal(bar.editing, true);
+      const previousCaptures = captures;
+      input('\\x1b');
+      await delay(70);
+      assert.equal(bar.editing, false);
+      assert.equal(pauses.at(-1), false);
+      assert.ok(captures > previousCaptures);
+      process.exit(0);
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+      timeout: 5000, stdio: 'pipe', env: { ...process.env, TERM_PROGRAM: terminal, TMUX: '' },
+    });
+  });
+}

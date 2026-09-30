@@ -145,7 +145,7 @@ Create `~/.casty/bookmarks.json`:
 | `headlessShellPath` | Explicit path to an external standalone headless shell | Empty (managed download) |
 | `searchUrl` | Search engine URL | `https://www.google.com/search?q=` |
 | `transport` | Image transfer: `auto`, `file`, `inline` | `auto` (bcon/kitty→file, others→inline) |
-| `format` | Capture format: `auto`, `png`, `jpeg` | `auto` (file→jpeg adaptive, inline→png) |
+| `format` | Capture format: `auto`, `png`, `jpeg` (JPEG requires bcon file transfer; otherwise PNG) | `auto` (bcon file→jpeg adaptive, others→png) |
 | `mouseMode` | `1002` (button-event) or `1003` (any-event) | `1003` (hover enabled) |
 | `media` | Enable camera/mic for WebRTC (experimental, requires `ffmpeg`) | `false` |
 
@@ -170,7 +170,7 @@ The whole thing is about 1200 lines of JavaScript. Here's what's going on under 
 - `Runtime.enable` is never sent (it breaks Google login — discovered the hard way)
 - Stealth patches are injected via `Page.addScriptToEvaluateOnNewDocument` before any page loads
 - Frame capture is hybrid: low-res Screencast triggers change detection, then `Page.captureScreenshot` grabs hi-res frames with proper DPR
-- File transfer mode uses adaptive JPEG→PNG: fast JPEG during scrolling/video, crisp PNG after things settle
+- bcon file transfer uses adaptive JPEG→PNG: fast JPEG during scrolling/video, crisp PNG after things settle
 - Terminal pixel size is detected via CSI 14t for auto-zoom
 
 ```
@@ -191,6 +191,24 @@ lib/bookmarks.js   Bookmark search
 </details>
 
 ## Troubleshooting
+
+### Videos fail to load on ARM64 Linux
+
+Codec support depends on the headless-shell build. Some ARM64 Linux builds do
+not support H.264 video or AAC audio, even when AV1/VP9 video and Opus audio work.
+A video that fails to load or reports a duration of zero can be affected by this
+limitation. Changing the terminal's image transfer format does not add codecs.
+
+To inspect playback from a source checkout, keep casty open on the affected page
+and run this in another terminal as the same user:
+
+```bash
+node scripts/diagnose-playback.mjs
+```
+
+The script records the browser version, codec support, media errors, playback
+state, and Linux audio output information in `.local-logs/playback-*.json`.
+It observes the existing session without navigating the page.
 
 ### No audio on YouTube (Ubuntu Server)
 

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { launchChrome } from '../lib/chrome.js';
 import { setupPage, startScreencast, stopScreencast } from '../lib/browser.js';
 import { dispatchClick } from '../lib/click.js';
@@ -89,6 +90,42 @@ test('headless browser regressions', { skip: !headlessShellPath, timeout: 60000 
         await client.send('Page.captureScreenshot', { format: 'png', optimizeForSpeed: true, captureBeyondViewport: false });
         assert.equal(await evaluate("getComputedStyle(document.getElementById('target')).backgroundColor"), 'rgb(0, 255, 0)');
       }
+    }
+  });
+
+  await t.test('scrolling past the top settles without capture feedback or stuck input', async () => {
+    await navigate();
+    await evaluate('document.body.style.height="3000px"');
+    for (const zoom of [1.25, 2, 0.75]) {
+      await client.setViewport({ width: 800, height: 601, zoom, nativeScale: 1.25 });
+      let frames = [];
+      const capture = await startScreencast(client, {
+        width: 800, height: 601, onFrame: data => frames.push(data),
+      });
+      try {
+        await evaluate('scrollTo(0,200)');
+        for (let i = 0; i < 12; i++) {
+          await within(client.send('Input.dispatchMouseEvent', {
+            type: 'mouseWheel', x: 400, y: 300, deltaX: 0, deltaY: -100,
+          }), 1000);
+          capture.forceCapture();
+        }
+        await delay(500);
+        assert.equal(await evaluate('scrollY'), 0);
+        frames = [];
+        for (let i = 0; i < 4; i++) {
+          await capture.forceCapture();
+          await delay(80);
+          assert.equal(await evaluate('scrollY'), 0);
+        }
+        assert.ok(frames.length > 0);
+        assert.equal(new Set(frames).size, 1, `resting top frame must not oscillate at zoom ${zoom}`);
+        const count = frames.length;
+        await delay(250);
+        assert.equal(frames.length, count, 'capture must settle after input stops');
+        await within(dispatchClick(client, 200, 150), 1000);
+        assert.equal((await evaluate('clicks.at(-1)')).id, 'target');
+      } finally { await stopScreencast(client, capture.cleanup); }
     }
   });
 
