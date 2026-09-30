@@ -54,6 +54,22 @@ cd casty && npm install
 
 初回起動時に Chrome Headless Shell が `~/.casty/browsers/` に自動インストールされます。
 
+既存の standalone headless shell を使う場合は、実行ファイルを明示的に指定できます。
+
+```bash
+casty --headless-shell /usr/bin/chromium-headless-shell https://example.com
+```
+
+`~/.casty/config.json` に `"headlessShellPath": "/usr/bin/chromium-headless-shell"`
+を保存することもできます。起動引数が設定ファイルより優先されます。明示指定した場合は
+自動ダウンロード・更新確認を行わず、無効なパスはエラーになります。指定がなければ
+casty 管理の headless shell を使い、システムの Chrome/Chromium は自動選択しません。
+外部の実行ファイルも、デスクトップ版ではなく standalone headless shell が対象です。
+
+最小構成の Debian で外部の headless shell を選ぶ場合は、
+`apt install chromium-headless-shell ca-certificates fonts-noto-cjk fonts-noto-color-emoji`
+でブラウザとフォントを導入し、上の例のように実行ファイルを指定できます。
+
 ### 必要環境
 
 - **Kitty graphics protocol** 対応ターミナル（動作確認済み: Ghostty, kitty, bcon）
@@ -118,19 +134,21 @@ casty   # ホームページを開く
   "homeUrl": "https://github.com/sanohiro/casty",
   "searchUrl": "https://www.google.com/search?q=",
   "transport": "auto",
-  "format": "auto",
-  "mouseMode": 1002
+  "format": "auto"
 }
 ```
 
 | キー | 説明 | デフォルト |
 |------|------|-----------|
 | `homeUrl` | スタートページ | `https://github.com/sanohiro/casty` |
+| `headlessShellPath` | 外部の standalone headless shell の実行ファイル | 空（自動取得版） |
 | `searchUrl` | 検索エンジン URL | `https://www.google.com/search?q=` |
 | `transport` | 画像転送方式: `auto`, `file`, `inline` | `auto` (bcon/kitty→file、他→inline) |
 | `format` | キャプチャ形式: `auto`, `png`, `jpeg` | `auto` (file→jpeg adaptive、inline→png) |
-| `mouseMode` | `1002` (ボタンイベント) or `1003` (全イベント) | 自動 (Ghostty→1003、他→1002) |
+| `mouseMode` | `1002` (ボタンイベント) or `1003` (全イベント) | `1003` (ホバー有効) |
 | `media` | WebRTC 用カメラ/マイク有効化（実験的、`ffmpeg` 必要） | `false` |
+
+Ghostty ではピクセル単位のマウス座標を使い、拡大時のホバーとクリックを正確にします。tmux 内ではセル座標を使います。
 
 ## 比較
 
@@ -198,6 +216,11 @@ casty  # Chrome が自動で再ダウンロードされます
 ```bash
 rm -rf ~/.casty
 ```
+
+## 謝辞
+
+入力とページ遷移の修正は、[Issue #5](https://github.com/sanohiro/casty/issues/5) で共有された
+[jjtseng93 さんの fork](https://github.com/jjtseng93/casty) をもとに取り込みました。
 
 ## ライセンス
 

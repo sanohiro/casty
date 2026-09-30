@@ -32,7 +32,7 @@ Key points:
 - **Kitty graphics protocol** — bcon, kitty, Ghostty, etc.
 - Node.js >= 18
 - `unzip` (for Chrome auto-install)
-- chrome-headless-shell (auto-downloaded) or system Chromium
+- chrome-headless-shell (auto-downloaded), or an explicitly selected external headless shell
 
 ## Files
 
@@ -71,6 +71,11 @@ Customizable via `~/.casty/keys.json`.
 Screencast (1/4 resolution) is used only as a change-detection trigger.
 `Page.captureScreenshot` delivers full DPR-aware frames (~12fps).
 Screencast ignores DPR, so using it directly produces blurry output.
+Chrome's native scale is fixed at launch. Startup and resize use the same
+viewport update: emulation scale is current DPR / native DPR, and visible size
+is the floored CSS viewport multiplied by that scale. This matches screenshot
+capture geometry and prevents hover from shifting during capture. Screenshot
+capture, pointer input, and viewport changes are serialized.
 
 ### Stealth Patches
 

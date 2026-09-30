@@ -6,3 +6,4 @@ package-lock.json
 .claude/
 work/
 _node_modules/
+.local-logs/
