@@ -191,7 +191,7 @@ async function main() {
   setDisplaySize(term.cols, term.rows - 1);
 
   // Phase 2: CDP connection + page setup
-  const { client, cssWidth, cssHeight } = await setupPage(browser, { ...term, height: viewHeight, mediaPort: media?.port || 0 });
+  const { client, cssWidth, cssHeight } = await setupPage(browser, { ...term, height: viewHeight, mediaPort: media?.port || 0, mediaToken: media?.token || '' });
   const chromeProcess = browser.proc;
 
   // Log WebSocket errors to stderr (prevent unhandled crash)
