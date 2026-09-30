@@ -1,0 +1,210 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, delimiter } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import WebSocket from 'ws';
+import { startMedia } from '../lib/media.js';
+import { launchChrome } from '../lib/chrome.js';
+import { setupPage } from '../lib/browser.js';
+import { loadConfig } from '../lib/config.js';
+
+async function until(check) {
+  for (let i = 0; i < 100; i++) {
+    if (await check()) return;
+    await delay(20);
+  }
+  assert.fail('Timed out waiting for media state');
+}
+
+// Replace every device probe and capture process; never open real camera/mic devices.
+async function fixture(t) {
+  const dir = await mkdtemp(join(tmpdir(), 'casty-media-test-'));
+  const bin = join(dir, 'bin');
+  const log = join(dir, 'capture.log');
+  await mkdir(bin);
+  await writeFile(log, '');
+  await writeFile(join(bin, 'ffmpeg'), `#!${process.execPath}
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('-version')) process.exit(0);
+if (!args.includes('pipe:1')) process.exit(1);
+const log = ${JSON.stringify(log)};
+appendFileSync(log, 'start ' + process.pid + '\\n');
+process.on('SIGTERM', () => {
+  appendFileSync(log, 'stop ' + process.pid + '\\n');
+  process.exit(0);
+});
+setInterval(() => process.stdout.write(Buffer.alloc(9600)), 20);
+`, { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = bin + delimiter + oldPath;
+  const sockets = [];
+  const relays = [];
+  t.after(async () => {
+    for (const ws of sockets) ws.terminate();
+    for (const media of relays) media.cleanup();
+    await until(async () => {
+      const entries = (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean);
+      return entries.filter(s => s.startsWith('start ')).length === entries.filter(s => s.startsWith('stop ')).length;
+    });
+    process.env.PATH = oldPath;
+    await rm(dir, { recursive: true, force: true });
+  });
+  async function start() {
+    const media = await startMedia({ audioDevice: 'test-input' });
+    relays.push(media);
+    return media;
+  }
+  function connect(media, path) {
+    const ws = new WebSocket(`ws://127.0.0.1:${media.port}${path}`, { origin: 'https://unrelated.example' });
+    sockets.push(ws);
+    return ws;
+  }
+  async function counts() {
+    const entries = (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean);
+    return {
+      starts: entries.filter(s => s.startsWith('start ')).length,
+      stops: entries.filter(s => s.startsWith('stop ')).length,
+    };
+  }
+  return { start, connect, counts, dir };
+}
+
+test('media relay authenticates before starting capture and rotates session tokens', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const first = await f.start();
+  const second = await f.start();
+  assert.match(first.token, /^[0-9a-f]{32}$/);
+  assert.notEqual(first.token, second.token);
+  for (const path of ['/', '/incorrect', `/${first.token}?extra=1`, `/${first.token}/`, `/${second.token}`]) {
+    await assert.rejects(once(f.connect(first, path), 'open'), /Unexpected server response: 401/);
+  }
+  assert.deepEqual(await f.counts(), { starts: 0, stops: 0 });
+  const ws = f.connect(first, `/${first.token}`);
+  const [data] = await once(ws, 'message');
+  assert.equal(data[0], 2);
+  assert.equal(data.length, 9601);
+  const other = f.connect(first, `/${first.token}`);
+  await once(other, 'message');
+  ws.close();
+  await once(ws, 'close');
+  assert.equal((await f.counts()).stops, 0);
+  other.close();
+  await until(async () => (await f.counts()).stops === 1);
+});
+
+const headlessShellPath = process.env.CASTY_TEST_HEADLESS_SHELL;
+test('page media lifecycle releases capture and supports restarting', { skip: !headlessShellPath, timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const media = await f.start();
+  const server = createServer((req, res) => res.end('<!doctype html><title>Media regression</title>'));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const config = loadConfig();
+  const previousMedia = config.media;
+  config.media = true;
+  const profile = await mkdtemp(join(tmpdir(), 'casty-media-profile-'));
+  let browser, client;
+  t.after(async () => {
+    config.media = previousMedia;
+    if (browser) {
+      const exited = browser.proc.exitCode === null ? once(browser.proc, 'exit') : Promise.resolve();
+      if (client) {
+        await client.send('Browser.close').catch(() => {});
+        client.close();
+      }
+      browser.proc.kill();
+      await exited;
+    }
+    server.close();
+    await rm(profile, { recursive: true, force: true });
+  });
+  browser = await launchChrome({ userDataDir: profile, headlessShellPath });
+  ({ client } = await setupPage(browser, { width: 800, height: 600, mediaPort: media.port, mediaToken: media.token }));
+  const evaluate = async expression => {
+    const { result, exceptionDetails } = await client.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+    assert.equal(exceptionDetails, undefined);
+    return result.value;
+  };
+  async function navigate() {
+    const loaded = once(client, 'Page.loadEventFired');
+    await client.send('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
+    await loaded;
+    await evaluate(`
+      window.sockets = [];
+      window.contexts = [];
+      window.packetCount = 0;
+      const NativeWebSocket = window.WebSocket;
+      window.WebSocket = class extends NativeWebSocket {
+        constructor(url) {
+          super(url);
+          sockets.push(this);
+          this.addEventListener('message', () => packetCount++);
+        }
+      };
+      const NativeAudioContext = window.AudioContext;
+      window.AudioContext = class extends NativeAudioContext {
+        constructor(options) { super(options); contexts.push(this); }
+      };
+    `);
+  }
+  async function start(constraints = '{ audio: true, video: true }') {
+    await evaluate(`(async () => { window.packetCount = 0; window.stream = await navigator.mediaDevices.getUserMedia(${constraints}); })()`);
+    await until(async () => await evaluate('packetCount > 0'));
+  }
+  async function stopped() {
+    await until(async () => await evaluate('sockets.every(s => s.readyState === WebSocket.CLOSED)'));
+    assert.equal(await evaluate('contexts.every(c => c.state === "closed")'), true);
+    await until(async () => {
+      const counts = await f.counts();
+      return counts.starts === counts.stops;
+    });
+  }
+  await navigate();
+  await t.test('stop() closes the relay and audio resources after the last track', async () => {
+    await start();
+    await evaluate('stream.getAudioTracks()[0].stop()');
+    assert.equal(await evaluate('sockets[0].readyState'), 1);
+    await evaluate('stream.getVideoTracks()[0].stop(); stream.getVideoTracks()[0].stop()');
+    await stopped();
+  });
+  await t.test('cloned tracks keep capture alive until they also stop', async () => {
+    await start('{ audio: true }');
+    await evaluate('window.clone = stream.clone(); stream.getTracks().forEach(t => t.stop())');
+    assert.equal(await evaluate('sockets.at(-1).readyState'), 1);
+    await evaluate('clone.getTracks().forEach(t => t.stop())');
+    await stopped();
+  });
+  await t.test('removing a live track from the stream does not lose its cleanup', async () => {
+    await start();
+    await evaluate('window.removed = stream.getVideoTracks()[0]; stream.removeTrack(removed); stream.getTracks().forEach(t => t.stop())');
+    assert.equal(await evaluate('sockets.at(-1).readyState'), 1);
+    await evaluate('removed.stop()');
+    await stopped();
+  });
+  await t.test('navigation disconnects the old relay and a new page reconnects', async () => {
+    await start('{ audio: true }');
+    await navigate();
+    await until(async () => {
+      const counts = await f.counts();
+      return counts.starts === counts.stops;
+    });
+    await start('{ audio: true }');
+    await evaluate('stream.getTracks().forEach(t => t.stop())');
+    await stopped();
+  });
+  await t.test('video-only streams stop without audio resources', async () => {
+    await start('{ video: true }');
+    await evaluate('stream.getTracks().forEach(t => t.stop())');
+    await stopped();
+  });
+  await t.test('a lost relay connection ends tracks and releases audio resources', async () => {
+    await start();
+    await evaluate('sockets.at(-1).close()');
+    await stopped();
+    assert.equal(await evaluate('stream.getTracks().every(t => t.readyState === "ended")'), true);
+  });
+});
