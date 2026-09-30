@@ -54,6 +54,23 @@ cd casty && npm install
 
 Chrome Headless Shell is auto-installed to `~/.casty/browsers/` on first run.
 
+To use an existing standalone headless shell, select its executable explicitly:
+
+```bash
+casty --headless-shell /usr/bin/chromium-headless-shell https://example.com
+```
+
+You can also set `"headlessShellPath": "/usr/bin/chromium-headless-shell"` in
+`~/.casty/config.json`. The command-line option overrides the config. An explicit
+path skips managed downloads and update checks; an invalid path reports an error.
+Without a path, casty uses its managed headless shell and does not select a system
+Chrome/Chromium automatically. External executables must be standalone headless
+shells, not full desktop browsers.
+
+On a minimal Debian installation, the optional external shell and fonts can be
+installed with `apt install chromium-headless-shell ca-certificates fonts-noto-cjk
+fonts-noto-color-emoji`. Then select `/usr/bin/chromium-headless-shell` as above.
+
 ### Requirements
 
 - A terminal with **Kitty graphics protocol** support (tested on Ghostty, kitty, bcon)
@@ -118,19 +135,21 @@ Create `~/.casty/bookmarks.json`:
   "homeUrl": "https://github.com/sanohiro/casty",
   "searchUrl": "https://www.google.com/search?q=",
   "transport": "auto",
-  "format": "auto",
-  "mouseMode": 1002
+  "format": "auto"
 }
 ```
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `homeUrl` | Start page | `https://github.com/sanohiro/casty` |
+| `headlessShellPath` | Explicit path to an external standalone headless shell | Empty (managed download) |
 | `searchUrl` | Search engine URL | `https://www.google.com/search?q=` |
 | `transport` | Image transfer: `auto`, `file`, `inline` | `auto` (bcon/kitty→file, others→inline) |
 | `format` | Capture format: `auto`, `png`, `jpeg` | `auto` (file→jpeg adaptive, inline→png) |
-| `mouseMode` | `1002` (button-event) or `1003` (any-event) | Auto (Ghostty→1003, others→1002) |
+| `mouseMode` | `1002` (button-event) or `1003` (any-event) | `1003` (hover enabled) |
 | `media` | Enable camera/mic for WebRTC (experimental, requires `ffmpeg`) | `false` |
+
+Ghostty uses pixel-level mouse coordinates for precise hover and clicks. Inside tmux, casty uses cell coordinates.
 
 ## Comparison
 
@@ -198,6 +217,11 @@ To reset all settings and profile data:
 ```bash
 rm -rf ~/.casty
 ```
+
+## Acknowledgments
+
+Input and navigation fixes were adapted from [jjtseng93's fork](https://github.com/jjtseng93/casty),
+shared in [issue #5](https://github.com/sanohiro/casty/issues/5).
 
 ## License
 

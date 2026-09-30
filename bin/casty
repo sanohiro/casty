@@ -11,6 +11,11 @@ while [ -L "$SOURCE" ]; do
 done
 CASTY_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
+# Parse CLI/config in Node before deciding whether a download is needed.
+if [ -z "$CASTY_ENSURE_CHROME" ]; then
+  exec node "$CASTY_DIR/bin/casty.js" "$@"
+fi
+
 BROWSERS_DIR="$HOME/.casty/browsers"
 STAMP="$HOME/.casty/.update-check"
 
@@ -99,7 +104,7 @@ install_chromium() {
 
   echo "casty: Installing Chrome Headless Shell ${version}..." >&2
 
-  local tmp_zip=$(mktemp /tmp/casty-chrome-XXXXXX.zip)
+  local tmp_zip=$(mktemp /tmp/casty-chrome.XXXXXX)
   # プログレスバー付きダウンロード (TTY ならバー表示、パイプなら非表示)
   if [ -t 2 ]; then
     curl -fL --progress-bar "$download_url" -o "$tmp_zip" 2>&1 >&2
@@ -167,14 +172,6 @@ has_chrome() {
   return 1
 }
 
-# システム Chrome/Chromium があるか
-has_system_chrome() {
-  command -v chromium-browser >/dev/null 2>&1 || \
-  command -v chromium >/dev/null 2>&1 || \
-  command -v google-chrome-stable >/dev/null 2>&1 || \
-  command -v google-chrome >/dev/null 2>&1
-}
-
 if ! has_chrome; then
   # unzip が必要 (Chrome for Testing は zip 配布)
   if ! is_arm64_linux && ! command -v unzip >/dev/null 2>&1; then
@@ -189,14 +186,9 @@ if ! has_chrome; then
     install_chromium
   fi
   if ! has_chrome; then
-    # Playwright も失敗した場合、システム Chromium にフォールバック
-    if ! has_system_chrome; then
-      echo "casty: Chrome not found." >&2
-      if is_arm64_linux; then
-        echo "casty: Install with: sudo apt install chromium-browser" >&2
-      fi
-      exit 1
-    fi
+    echo "casty: Headless shell installation failed." >&2
+    echo "casty: To use an existing headless shell, specify --headless-shell /path/to/chromium-headless-shell." >&2
+    exit 1
   fi
 fi
 
@@ -214,11 +206,4 @@ if needs_update; then
   else
     (install_chromium && cleanup_old_browsers) &>/dev/null &
   fi
-fi
-
-# When called from casty.js, CASTY_ENSURE_CHROME is set — just return
-# When called directly (./bin/casty), launch the app
-if [ -z "$CASTY_ENSURE_CHROME" ]; then
-  export CASTY_ENSURE_CHROME=1
-  exec node "$CASTY_DIR/bin/casty.js" "$@"
 fi

@@ -11,16 +11,23 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { parseArgs } from '../lib/cli.js';
+import { findChrome } from '../lib/chrome.js';
+import { toURL } from '../lib/urlbar.js';
+
+let options;
+try { options = parseArgs(process.argv.slice(2)); }
+catch (err) { console.error(`casty: ${err.message}`); process.exit(1); }
 
 // --version / -v
-if (process.argv[2] === '--version' || process.argv[2] === '-v') {
+if (options.version) {
   const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'));
   console.log(`casty ${pkg.version}`);
   process.exit(0);
 }
 
 // --help / -h
-if (process.argv[2] === '--help' || process.argv[2] === '-h') {
+if (options.help) {
   console.log(`casty - A real Chrome browser in your terminal
 
 Usage: casty [url] [options]
@@ -28,6 +35,7 @@ Usage: casty [url] [options]
 Options:
   --help, -h       Show this help
   --version, -v    Show version
+  --headless-shell PATH  Use an external headless shell (overrides config)
 
 Key bindings:
   Alt+L            Address bar
@@ -48,8 +56,14 @@ https://github.com/sanohiro/casty`);
   process.exit(0);
 }
 
-// Ensure Chrome is installed (skip if launched from bin/casty shell script)
-if (!process.env.CASTY_ENSURE_CHROME) {
+const config = loadConfig();
+const headlessShellPath = options.headlessShellPath ?? config.headlessShellPath;
+try {
+  if (headlessShellPath !== '') findChrome(headlessShellPath);
+} catch (err) { console.error(`casty: ${err.message}`); process.exit(1); }
+
+// Explicit external shells do not need the managed installer or updater.
+if (!headlessShellPath && !process.env.CASTY_ENSURE_CHROME) {
   const __bin = dirname(fileURLToPath(import.meta.url));
   try {
     execFileSync('bash', [join(__bin, 'casty')], {
@@ -57,22 +71,24 @@ if (!process.env.CASTY_ENSURE_CHROME) {
       env: { ...process.env, CASTY_ENSURE_CHROME: '1' },
     });
   } catch (err) {
-    if (err.status) process.exit(err.status);
+    console.error(`casty: headless shell installation failed: ${err.message}`);
+    process.exit(err.status || 1);
   }
 }
 
 import { startBrowser, setupPage, startScreencast, stopScreencast } from '../lib/browser.js';
 import { sendFrame, resetFrameCache, clearScreen, hideCursor, showCursor, cleanup as cleanupTmp, transport, setDisplaySize, disableDedup } from '../lib/kitty.js';
-import { enableMouse, disableMouse, startInputHandling } from '../lib/input.js';
+import { enableMouse, disableMouse, mouseMode, mouseFormat, startInputHandling } from '../lib/input.js';
 import { loadKeyBindings } from '../lib/keys.js';
 import { loadConfig } from '../lib/config.js';
 import { startMedia } from '../lib/media.js';
+import { mouseTraceFile, traceMouse } from '../lib/trace.js';
 
-const config = loadConfig();
 const bindings = loadKeyBindings();
-const url = process.argv[2] || config.homeUrl;
+const url = toURL(options.url || config.homeUrl) || config.homeUrl;
 
-const TERM_QUERY_TIMEOUT = 1000;  // CSI 14t response timeout (ms)
+const TERM_QUERY_TIMEOUT = 1000;
+const TERM_PIXEL_FALLBACK_DELAY = 100;
 
 // Delayed capture timings after page navigation (ms)
 const DELAYED_CAPTURE_MS = [0, 300, 1000];
@@ -86,22 +102,27 @@ function calcZoom(cellWidth) {
   return cellWidth / REF_CELL_WIDTH;
 }
 
-// Query terminal pixel size via CSI 14t
+// Query exact cell size via CSI 16t, with CSI 14t as a fallback.
 // keepAlive: true when called during operation (SIGWINCH) — don't touch stdin state
-function queryTermPixelSize({ keepAlive = false } = {}) {
+function queryTermSize({ keepAlive = false } = {}) {
   if (!process.stdin.isTTY) return Promise.resolve(null);
 
   let resolve;
   const promise = new Promise(r => { resolve = r; });
   const wasRaw = process.stdin.isRaw;
-  const timeout = setTimeout(() => {
+  let fallbackTimer;
+  let windowSize = null;
+  function finish(size) {
+    clearTimeout(timeout);
+    clearTimeout(fallbackTimer);
     process.stdin.removeListener('data', onData);
     if (!keepAlive) {
       process.stdin.setRawMode(wasRaw);
       process.stdin.pause();
     }
-    resolve(null);
-  }, TERM_QUERY_TIMEOUT);
+    resolve(size);
+  }
+  const timeout = setTimeout(() => finish(windowSize), TERM_QUERY_TIMEOUT);
 
   if (!keepAlive) {
     process.stdin.setRawMode(true);
@@ -111,36 +132,38 @@ function queryTermPixelSize({ keepAlive = false } = {}) {
   let buf = '';
   const onData = (data) => {
     buf += data.toString();
-    const match = buf.match(/\x1b\[4;(\d+);(\d+)t/);
-    if (match) {
-      clearTimeout(timeout);
-      process.stdin.removeListener('data', onData);
-      if (!keepAlive) process.stdin.setRawMode(wasRaw);
-      resolve({ height: parseInt(match[1]), width: parseInt(match[2]) });
+    const cell = buf.match(/\x1b\[6;(\d+);(\d+)t/);
+    if (cell && +cell[1] > 0 && +cell[2] > 0) {
+      finish({ cellHeight: +cell[1], cellWidth: +cell[2] });
+      return;
+    }
+    const window = buf.match(/\x1b\[4;(\d+);(\d+)t/);
+    if (window && +window[1] > 0 && +window[2] > 0 && !windowSize) {
+      windowSize = { height: +window[1], width: +window[2] };
+      fallbackTimer = setTimeout(() => finish(windowSize), TERM_PIXEL_FALLBACK_DELAY);
     }
   };
   process.stdin.on('data', onData);
 
-  process.stdout.write('\x1b[14t');
+  process.stdout.write('\x1b[16t\x1b[14t');
   return promise;
 }
 
 // Get terminal info
 // keepAlive: true during operation (SIGWINCH) to avoid killing stdin
 async function getTermInfo({ keepAlive = false } = {}) {
+  const reportedSize = await queryTermSize({ keepAlive });
   const cols = process.stdout.columns || 80;
   const rows = process.stdout.rows || 24;
-
-  const pixelSize = await queryTermPixelSize({ keepAlive });
-  if (pixelSize) {
-    // Align to cell boundaries: floor cell size, then multiply back
-    // This ensures image pixels == display pixels (no GPU interpolation blur)
-    const cellWidth = Math.floor(pixelSize.width / cols);
-    const cellHeight = Math.floor(pixelSize.height / rows);
+  if (reportedSize) {
+    // The window can contain padding; only CSI 16t reports the true cell size.
+    const cellWidth = reportedSize.cellWidth || Math.floor(reportedSize.width / cols);
+    const cellHeight = reportedSize.cellHeight || Math.floor(reportedSize.height / rows);
     const width = cellWidth * cols;
     const height = cellHeight * rows;
     const zoom = calcZoom(cellWidth);
-    return { cols, rows, width, height, cellWidth, cellHeight, zoom };
+    const sizeSource = reportedSize.cellWidth ? 'cell' : 'window';
+    return { cols, rows, width, height, cellWidth, cellHeight, zoom, sizeSource };
   }
 
   const cellWidth = parseInt(process.env.CASTY_CELL_WIDTH) || 10;
@@ -150,17 +173,16 @@ async function getTermInfo({ keepAlive = false } = {}) {
     cols, rows,
     width: cols * cellWidth,
     height: rows * cellHeight,
-    cellWidth, cellHeight, zoom,
+    cellWidth, cellHeight, zoom, sizeSource: 'fallback',
   };
 }
 
 async function main() {
-  // Phase 1: Launch Chrome, get terminal info, and start media in parallel
-  // getTermInfo() must complete fully (prevent CSI 14t response leak)
-  const browserP = startBrowser();
+  // Phase 1: Read the initial zoom before launching Chrome; media starts in parallel.
+  // getTermInfo() must complete fully before input handling starts.
   const mediaP = config.media ? startMedia(config) : null;
   const term = await getTermInfo();
-  const browser = await browserP;
+  const browser = await startBrowser(term.zoom, headlessShellPath);
   const media = mediaP ? await mediaP : null;
 
   // Reserve line 1 for URL bar, use the rest for browser display
@@ -175,9 +197,6 @@ async function main() {
   // Log WebSocket errors to stderr (prevent unhandled crash)
   client.on('error', (err) => { console.error('casty: CDP error:', err.message); });
 
-  // Navigate immediately (before screencast) to avoid showing previous session's page
-  client.send('Page.navigate', { url }).catch(e => console.error('casty: navigate error:', e.message));
-
   let renderPaused = false;
   const pauseRender = (p = true) => { renderPaused = p; };
 
@@ -185,8 +204,7 @@ async function main() {
   clearScreen();
   enableMouse();
 
-  // Mouse coordinates in device pixels
-  // Chrome headless-shell ignores deviceScaleFactor for Input.dispatchMouseEvent
+  // input.js converts terminal device pixels to viewport CSS pixels.
   const cssCellW = term.cellWidth;
   const cssCellH = term.cellHeight;
   // format: auto → PNG for inline, JPEG (adaptive) for file transfer
@@ -196,13 +214,16 @@ async function main() {
     ? (transport === 'file' ? 'jpeg' : 'png')
     : fmt;
 
-  console.error(`casty: ${term.width}x${term.height} cell=${term.cellWidth.toFixed(0)}x${term.cellHeight.toFixed(0)} zoom=${term.zoom.toFixed(2)} transport=${transport} format=${screenshotFormat}${screenshotFormat === 'jpeg' ? ' (adaptive)' : ''}`);
+  console.error(`casty: ${term.width}x${term.height} cell=${term.cellWidth.toFixed(0)}x${term.cellHeight.toFixed(0)} size=${term.sizeSource} zoom=${term.zoom.toFixed(2)} mouse=${mouseFormat} tracking=${mouseMode} transport=${transport} format=${screenshotFormat}${screenshotFormat === 'jpeg' ? ' (adaptive)' : ''}`);
+  if (mouseTraceFile) console.error(`casty: mouse trace ${mouseTraceFile}`);
+  traceMouse('mouse-geometry', { cellWidth: term.cellWidth, cellHeight: term.cellHeight, zoom: term.zoom });
+  traceMouse('viewport', { width: cssWidth, height: cssHeight, zoom: term.zoom, cols: term.cols, rows: term.rows, sizeSource: term.sizeSource });
 
   // Frame callback for screencast / captureScreenshot
   // sendFrame includes cursor positioning (single write)
   let urlBar = null;
   function onFrame(data) {
-    if (renderPaused) return;
+    if (renderPaused) { traceMouse('frame-paused'); return; }
     sendFrame(data);
     if (urlBar) urlBar.renderIfDirty();
   }
@@ -215,7 +236,7 @@ async function main() {
     onFrame,
   });
 
-  urlBar = startInputHandling(client, cssCellW, cssCellH, bindings, pauseRender, forceCapture);
+  urlBar = startInputHandling(client, cssCellW, cssCellH, term.zoom, bindings, pauseRender, () => forceCapture());
   urlBar.render();
 
   // Force capture on page load events (debounced — multiple events fire close together)
@@ -233,6 +254,10 @@ async function main() {
   client.on('Page.frameNavigated', ({ frame }) => {
     if (!frame.parentId) delayedCapture(); // Main frame only
   });
+  client.on('Page.navigatedWithinDocument', delayedCapture);
+
+  // Fast local pages can finish loading before capture and input listeners exist.
+  client.send('Page.navigate', { url }).catch(e => console.error('casty: navigate error:', e.message));
 
   let shuttingDown = false;
   async function shutdown() {
@@ -240,6 +265,7 @@ async function main() {
     shuttingDown = true;
     console.error('casty: shutting down...');
     renderPaused = true;           // Stop rendering first
+    for (const timer of delayedTimers) clearTimeout(timer);
     try {
       await stopScreencast(client, screencastCleanup);  // Stop screencast (disables pending captures)
       await client.send('Browser.close').catch(() => {});
@@ -290,16 +316,17 @@ async function main() {
       const cw = Math.round(t.width / t.zoom);
       const ch = Math.round(vh / t.zoom);
       setDisplaySize(t.cols, t.rows - 1);
-      console.error(`casty: resize ${cw}x${ch} (dev:${t.width}x${vh}) zoom:${t.zoom.toFixed(2)}`);
+      console.error(`casty: resize ${cw}x${ch} (dev:${t.width}x${vh}) cell:${t.cellWidth}x${t.cellHeight} size:${t.sizeSource} zoom:${t.zoom.toFixed(2)}`);
 
-      urlBar.updateCellSize(t.cellWidth, t.cellHeight);
       clearScreen();
       resetFrameCache();
       disableDedup(3000); // Force re-send for 3s (bcon may not display first frame)
 
-      await client.send('Emulation.setDeviceMetricsOverride', {
-        width: cw, height: ch, deviceScaleFactor: t.zoom, mobile: false,
-      });
+      const metricsUpdate = client.setViewport({ width: cw, height: ch, zoom: t.zoom, nativeScale: term.zoom });
+      // Input after this point must use the new geometry and queue behind the metrics update.
+      urlBar.updateCellSize(t.cellWidth, t.cellHeight, t.zoom);
+      await metricsUpdate;
+      traceMouse('viewport', { width: cw, height: ch, zoom: t.zoom, cols: t.cols, rows: t.rows, sizeSource: t.sizeSource });
 
       // Wait for Chrome to finish re-rendering by watching for a screencast frame
       await new Promise(resolve => {
