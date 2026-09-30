@@ -21,24 +21,32 @@ async function until(check) {
 }
 
 // Replace every device probe and capture process; never open real camera/mic devices.
-async function fixture(t) {
+async function fixture(t, { ignoreTerm = false, listAudio = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'casty-media-test-'));
   const bin = join(dir, 'bin');
   const log = join(dir, 'capture.log');
   await mkdir(bin);
   await writeFile(log, '');
   await writeFile(join(bin, 'ffmpeg'), `#!${process.execPath}
-const { appendFileSync } = require('node:fs');
+const { appendFileSync, writeFileSync } = require('node:fs');
 const args = process.argv.slice(2);
 if (args.includes('-version')) process.exit(0);
+if (${listAudio} && args.includes('-list_devices')) {
+  console.error('AVFoundation video devices:\\nAVFoundation audio devices:\\n[0] Offline phone\\n[1] Built-in microphone');
+  process.exit(1);
+}
 if (!args.includes('pipe:1')) process.exit(1);
+writeFileSync(${JSON.stringify(join(dir, 'capture-args.json'))}, JSON.stringify(args));
 const log = ${JSON.stringify(log)};
 appendFileSync(log, 'start ' + process.pid + '\\n');
 process.on('SIGTERM', () => {
+  if (${ignoreTerm}) return;
   appendFileSync(log, 'stop ' + process.pid + '\\n');
   process.exit(0);
 });
-setInterval(() => process.stdout.write(Buffer.alloc(9600)), 20);
+const pcm = Buffer.alloc(9600);
+for (let i = 0; i < 4800; i++) pcm.writeInt16LE(Math.round(Math.sin(i * 2 * Math.PI * 440 / 48000) * 16000), i * 2);
+setInterval(() => process.stdout.write(pcm), 100);
 `, { mode: 0o755 });
   const oldPath = process.env.PATH;
   process.env.PATH = bin + delimiter + oldPath;
@@ -49,13 +57,13 @@ setInterval(() => process.stdout.write(Buffer.alloc(9600)), 20);
     for (const media of relays) media.cleanup();
     await until(async () => {
       const entries = (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean);
-      return entries.filter(s => s.startsWith('start ')).length === entries.filter(s => s.startsWith('stop ')).length;
+      return entries.filter(s => s.startsWith('start ')).every(s => !isRunning(Number(s.split(' ')[1])));
     });
     process.env.PATH = oldPath;
     await rm(dir, { recursive: true, force: true });
   });
-  async function start() {
-    const media = await startMedia({ audioDevice: 'test-input' });
+  async function start(config = { audioDevice: 'test-input', videoDevice: { idx: null } }) {
+    const media = await startMedia(config);
     relays.push(media);
     return media;
   }
@@ -71,8 +79,34 @@ setInterval(() => process.stdout.write(Buffer.alloc(9600)), 20);
       stops: entries.filter(s => s.startsWith('stop ')).length,
     };
   }
-  return { start, connect, counts, dir };
+  return { start, connect, counts, dir, log };
 }
+
+function isRunning(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+}
+
+test('macOS selects the default audio device instead of the first enumerated microphone', { skip: process.platform !== 'darwin', timeout: 10000 }, async t => {
+  const f = await fixture(t, { listAudio: true });
+  const media = await f.start({ videoDevice: { idx: null } });
+  const ws = f.connect(media, `/${media.token}`);
+  await once(ws, 'message');
+  const args = JSON.parse(await readFile(join(f.dir, 'capture-args.json'), 'utf8'));
+  assert.equal(args[args.indexOf('-i') + 1], ':default');
+  ws.close();
+});
+
+test('stopping capture terminates an unresponsive device process', { timeout: 10000 }, async t => {
+  const f = await fixture(t, { ignoreTerm: true });
+  const media = await f.start();
+  const ws = f.connect(media, `/${media.token}`);
+  await once(ws, 'message');
+  const pid = Number((await readFile(f.log, 'utf8')).trim().split(' ')[1]);
+  assert.ok(isRunning(pid));
+  ws.close();
+  await until(() => !isRunning(pid));
+});
 
 test('media relay authenticates before starting capture and rotates session tokens', { timeout: 10000 }, async t => {
   const f = await fixture(t);
@@ -164,10 +198,26 @@ test('page media lifecycle releases capture and supports restarting', { skip: !h
     });
   }
   await navigate();
+  await t.test('received PCM becomes audible samples in the returned audio track', async () => {
+    await start('{ audio: true }');
+    await evaluate(`
+      window.monitor = new AudioContext({ sampleRate: 48000 });
+      window.analyser = monitor.createAnalyser();
+      window.input = monitor.createMediaStreamSource(stream);
+      input.connect(analyser);
+    `);
+    await until(async () => await evaluate(`(() => {
+      const samples = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(samples);
+      return samples.some(s => Math.abs(s) > 0.1);
+    })()`));
+    await evaluate('input.disconnect(); monitor.close(); stream.getTracks().forEach(t => t.stop())');
+    await stopped();
+  });
   await t.test('stop() closes the relay and audio resources after the last track', async () => {
     await start();
     await evaluate('stream.getAudioTracks()[0].stop()');
-    assert.equal(await evaluate('sockets[0].readyState'), 1);
+    assert.equal(await evaluate('sockets.at(-1).readyState'), 1);
     await evaluate('stream.getVideoTracks()[0].stop(); stream.getVideoTracks()[0].stop()');
     await stopped();
   });
