@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
@@ -44,6 +47,7 @@ process.on('SIGTERM', () => {
   appendFileSync(log, 'stop ' + process.pid + '\\n');
   process.exit(0);
 });
+process.stdout.on('error', () => {});
 const pcm = Buffer.alloc(9600);
 for (let i = 0; i < 4800; i++) pcm.writeInt16LE(Math.round(Math.sin(i * 2 * Math.PI * 440 / 48000) * 16000), i * 2);
 setInterval(() => process.stdout.write(pcm), 100);
@@ -54,7 +58,7 @@ setInterval(() => process.stdout.write(pcm), 100);
   const relays = [];
   t.after(async () => {
     for (const ws of sockets) ws.terminate();
-    for (const media of relays) media.cleanup();
+    await Promise.all(relays.map(media => media.cleanup()));
     await until(async () => {
       const entries = (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean);
       return entries.filter(s => s.startsWith('start ')).every(s => !isRunning(Number(s.split(' ')[1])));
@@ -107,6 +111,40 @@ test('stopping capture terminates an unresponsive device process', { timeout: 10
   ws.close();
   await until(() => !isRunning(pid));
 });
+
+for (const disconnectFirst of [false, true]) {
+  test(`cleanup waits for capture before process exit (disconnected=${disconnectFirst})`, { timeout: 10000 }, async t => {
+    const f = await fixture(t, { ignoreTerm: true });
+    const source = `
+      import { startMedia } from ${JSON.stringify(new URL('../lib/media.js', import.meta.url).href)};
+      import WebSocket from ${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('ws')).href)};
+      import { once } from 'node:events';
+      const media = await startMedia({ audioDevice: 'test-input', videoDevice: { idx: null } });
+      const ws = new WebSocket('ws://127.0.0.1:' + media.port + '/' + media.token);
+      await once(ws, 'message');
+      if (${disconnectFirst}) {
+        ws.close();
+        await once(ws, 'close');
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      await media.cleanup();
+      process.exit(0);
+    `;
+    const parent = spawn(process.execPath, ['--input-type=module', '-e', source], { stdio: 'ignore' });
+    const timer = setTimeout(() => parent.kill('SIGKILL'), 5000);
+    let pid;
+    try {
+      const [code] = await once(parent, 'exit');
+      clearTimeout(timer);
+      assert.equal(code, 0);
+      pid = Number((await readFile(f.log, 'utf8')).trim().split(' ')[1]);
+      assert.equal(isRunning(pid), false, 'Capture must exit before its parent');
+    } finally {
+      clearTimeout(timer);
+      if (pid && isRunning(pid)) process.kill(pid, 'SIGKILL');
+    }
+  });
+}
 
 test('media relay authenticates before starting capture and rotates session tokens', { timeout: 10000 }, async t => {
   const f = await fixture(t);
@@ -227,6 +265,52 @@ test('page media lifecycle releases capture and supports restarting', { skip: !h
     assert.equal(await evaluate('sockets.at(-1).readyState'), 1);
     await evaluate('clone.getTracks().forEach(t => t.stop())');
     await stopped();
+  });
+  await t.test('clones of rewrapped streams keep receiving audio after originals stop', async () => {
+    await start('{ audio: true }');
+    await evaluate(`
+      window.clone = new MediaStream(stream).clone();
+      stream.getTracks().forEach(t => MediaStreamTrack.prototype.stop.call(t));
+      window.monitor = new AudioContext({ sampleRate: 48000 });
+      window.analyser = monitor.createAnalyser();
+      window.input = monitor.createMediaStreamSource(clone);
+      input.connect(analyser);
+    `);
+    assert.equal(await evaluate('sockets.at(-1).readyState'), 1);
+    await until(async () => await evaluate(`(() => {
+      const samples = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(samples);
+      return samples.some(s => Math.abs(s) > 0.1);
+    })()`));
+    await evaluate('input.disconnect(); monitor.close(); clone.getTracks().forEach(t => t.stop())');
+    await stopped();
+  });
+  await t.test('cloning tracks from two relays preserves each independent lifetime', async () => {
+    await start('{ audio: true }');
+    await evaluate('(async () => { window.other = await navigator.mediaDevices.getUserMedia({ audio: true }); })()');
+    await until(async () => await evaluate('sockets.at(-1).readyState === WebSocket.OPEN'));
+    await evaluate(`
+      window.mixed = new MediaStream([...stream.getTracks(), ...other.getTracks()]).clone();
+      stream.getTracks().forEach(t => t.stop());
+      other.getTracks().forEach(t => t.stop());
+    `);
+    assert.deepEqual(await evaluate('sockets.slice(-2).map(s => s.readyState)'), [1, 1]);
+    await evaluate('mixed.getTracks()[0].stop()');
+    await until(async () => await evaluate('sockets.slice(-2).some(s => s.readyState === WebSocket.CLOSED)'));
+    assert.equal(await evaluate('sockets.slice(-2).filter(s => s.readyState === WebSocket.OPEN).length'), 1);
+    await evaluate('mixed.getTracks()[1].stop()');
+    await stopped();
+  });
+  await t.test('native streams outside the relay retain their clone and stop behavior', async () => {
+    assert.deepEqual(await evaluate(`(() => {
+      const canvas = document.createElement('canvas');
+      const original = canvas.captureStream();
+      const clone = original.clone();
+      original.getTracks()[0].stop();
+      const states = [original.getTracks()[0].readyState, clone.getTracks()[0].readyState];
+      clone.getTracks()[0].stop();
+      return states;
+    })()`), ['ended', 'live']);
   });
   await t.test('removing a live track from the stream does not lose its cleanup', async () => {
     await start();
