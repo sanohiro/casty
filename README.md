@@ -170,7 +170,7 @@ The whole thing is about 1200 lines of JavaScript. Here's what's going on under 
 - `Runtime.enable` is never sent (it breaks Google login — discovered the hard way)
 - Stealth patches are injected via `Page.addScriptToEvaluateOnNewDocument` before any page loads
 - Frame capture is hybrid: low-res Screencast triggers change detection, then `Page.captureScreenshot` grabs hi-res frames with proper DPR
-- File transfer mode uses adaptive JPEG→PNG: fast JPEG during scrolling/video, crisp PNG after things settle
+- bcon file transfer uses adaptive JPEG→PNG: fast JPEG during scrolling/video, crisp PNG after things settle
 - Terminal pixel size is detected via CSI 14t for auto-zoom
 
 ```
