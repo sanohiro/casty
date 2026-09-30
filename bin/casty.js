@@ -77,7 +77,7 @@ if (!headlessShellPath && !process.env.CASTY_ENSURE_CHROME) {
 }
 
 import { startBrowser, setupPage, startScreencast, stopScreencast } from '../lib/browser.js';
-import { sendFrame, resetFrameCache, clearScreen, hideCursor, showCursor, cleanup as cleanupTmp, transport, setDisplaySize, disableDedup } from '../lib/kitty.js';
+import { sendFrame, resetFrameCache, clearScreen, hideCursor, showCursor, cleanup as cleanupTmp, transport, selectCaptureFormat, setDisplaySize, disableDedup } from '../lib/kitty.js';
 import { enableMouse, disableMouse, mouseMode, mouseFormat, startInputHandling } from '../lib/input.js';
 import { loadKeyBindings } from '../lib/keys.js';
 import { loadConfig } from '../lib/config.js';
@@ -198,26 +198,25 @@ async function main() {
   client.on('error', (err) => { console.error('casty: CDP error:', err.message); });
 
   let renderPaused = false;
-  const pauseRender = (p = true) => { renderPaused = p; };
-
-  hideCursor();
-  clearScreen();
-  enableMouse();
+  const pauseRender = (p = true) => {
+    renderPaused = p;
+    if (p) resetFrameCache();
+  };
 
   // input.js converts terminal device pixels to viewport CSS pixels.
   const cssCellW = term.cellWidth;
   const cssCellH = term.cellHeight;
-  // format: auto → PNG for inline, JPEG (adaptive) for file transfer
-  // jpeg mode: fast JPEG during activity, PNG refinement when static
-  const fmt = config.format || 'auto';
-  const screenshotFormat = fmt === 'auto'
-    ? (transport === 'file' ? 'jpeg' : 'png')
-    : fmt;
+  // Standard Kitty output uses PNG; bcon also supports adaptive JPEG files.
+  const screenshotFormat = selectCaptureFormat(config.format);
 
   console.error(`casty: ${term.width}x${term.height} cell=${term.cellWidth.toFixed(0)}x${term.cellHeight.toFixed(0)} size=${term.sizeSource} zoom=${term.zoom.toFixed(2)} mouse=${mouseFormat} tracking=${mouseMode} transport=${transport} format=${screenshotFormat}${screenshotFormat === 'jpeg' ? ' (adaptive)' : ''}`);
   if (mouseTraceFile) console.error(`casty: mouse trace ${mouseTraceFile}`);
   traceMouse('mouse-geometry', { cellWidth: term.cellWidth, cellHeight: term.cellHeight, zoom: term.zoom });
   traceMouse('viewport', { width: cssWidth, height: cssHeight, zoom: term.zoom, cols: term.cols, rows: term.rows, sizeSource: term.sizeSource });
+
+  hideCursor();
+  clearScreen();
+  enableMouse();
 
   // Frame callback for screencast / captureScreenshot
   // sendFrame includes cursor positioning (single write)

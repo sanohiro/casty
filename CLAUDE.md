@@ -90,12 +90,16 @@ Two transfer modes:
 - **File transfer (t=f)**: fast, sends file path only (bcon, kitty)
 - **Inline (t=d)**: sends base64 data in 4096B chunks (Ghostty, others)
 
-Adaptive format: JPEG during rapid updates, PNG refinement after idle (file transfer).
-PNG always for inline (Kitty protocol has no JPEG format code).
+Adaptive format: JPEG during rapid updates, PNG refinement after idle (bcon file transfer).
+Other terminals and inline transfers always use PNG (Kitty protocol has no JPEG format code).
+Alternate image IDs preserve the old frame until the new frame is transferred.
+Slow output retains only the latest pending frame.
 
 ### Input
 
 - SGR 1006 mouse protocol for clicks, drag, scroll
+- Pending motion and wheel reports are coalesced; stale wheel reports are discarded
+- Quit bypasses the input queue; page clicks cancel address-bar editing
 - macOS Option key: Unicode chars mapped back via rawBindings
 - Linux: ESC prefix buffering (50ms) for split Alt+Key sequences
 - OSC 52 for clipboard read/write
