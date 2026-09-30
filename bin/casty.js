@@ -272,7 +272,7 @@ async function main() {
     } catch {}
     client.close();
     chromeProcess.kill();
-    media?.cleanup();
+    await media?.cleanup();
     disableMouse();
     showCursor();
     try { process.stdin.setRawMode(false); } catch {}
