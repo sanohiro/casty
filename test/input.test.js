@@ -91,6 +91,91 @@ test('input preserves button holds, short drags, event ordering, and address-bar
   execFileSync(process.execPath, ['--input-type=module', '-e', source], { timeout: 5000, stdio: 'pipe' });
 });
 
+for (const terminal of ['ghostty', 'kitty']) {
+  test(`address editing preserves URLs and searches with split keys and scrolled clicks (${terminal})`, () => {
+    const source = `
+      import assert from 'node:assert/strict';
+      import { EventEmitter } from 'node:events';
+      import { setImmediate as turn } from 'node:timers/promises';
+      import { startInputHandling } from ${JSON.stringify(new URL('../lib/input.js', import.meta.url).href)};
+      import { loadConfig } from ${JSON.stringify(new URL('../lib/config.js', import.meta.url).href)};
+      process.stdout.write = () => true;
+      process.stdout.columns = 24;
+      process.stdin.setRawMode = () => {};
+      const client = new EventEmitter(), events = [];
+      client.send = async (method, params) => {
+        if (method === 'Page.getNavigationHistory') return { entries: [], currentIndex: 0 };
+        events.push({ method, ...params });
+        return {};
+      };
+      const bar = startInputHandling(client, 10, 20, 1, {'alt+l':'url_bar'}, () => {}, () => {});
+      const url = 'https://example.com/abcdefghijklmnopqrstuvwxyz0123456789';
+      bar.setUrl(url);
+      const input = str => process.stdin.emit('data', Buffer.from(str));
+      input('\\x1bl');
+      await turn();
+      assert.equal(bar.editing, true);
+      const keys = [
+        ['\\x1b[H', '\\x1b[F'], ['\\x1bOH', '\\x1bOF'],
+        ['\\x1b[1~', '\\x1b[4~'], ['\\x1b[7~', '\\x1b[8~'],
+      ];
+      for (const [home, end] of keys) {
+        for (const [key, cursor] of [[home, 0], [end, url.length]]) {
+          input(key.slice(0, -1));
+          await turn();
+          input(key.slice(-1));
+          await turn();
+          assert.equal(bar.cursor, cursor);
+          assert.equal(bar.text, url);
+        }
+      }
+      const pixels = process.env.TERM_PROGRAM === 'ghostty';
+      for (const [width, height] of [[10, 20], [16, 32]]) {
+        bar.updateCellSize(width, height, 2);
+        input('\\x1b[F');
+        await turn();
+        const x = pixels ? 6 * width : 6;
+        const y = pixels ? height - 1 : 1;
+        input('\\x1b[<0;' + x + ';' + y + 'M\\x1b[<0;' + x + ';' + y + 'm');
+        await turn();
+        assert.equal(bar.cursor, url.length - 18);
+        assert.equal(bar.selectAll, false);
+        assert.deepEqual(events, [], 'address clicks must not reach the page');
+      }
+      input('X');
+      input('\\r');
+      await turn();
+      assert.equal(bar.editing, false);
+      assert.deepEqual(events, [{ method: 'Page.navigate', url: url.slice(0, -18) + 'X' + url.slice(-18) }]);
+
+      loadConfig().searchUrl = 'https://search.example/?q=';
+      input('\\x1bl');
+      await turn();
+      const query = '東京の喫茶店 静かで仕事ができるお店';
+      bar.insertText(query);
+      input('\\x1b[H');
+      input('おすすめ ');
+      input('\\x1b[C');
+      input('\\x1b[C');
+      input('駅周辺');
+      input('\\x1b[F');
+      input(' & 営業中？');
+      input('\\r');
+      await turn();
+      const edited = 'おすすめ 東京駅周辺の喫茶店 静かで仕事ができるお店 & 営業中？';
+      assert.equal(bar.editing, false);
+      assert.equal(bar.text, edited);
+      assert.deepEqual(events.at(-1), {
+        method: 'Page.navigate', url: 'https://search.example/?q=' + encodeURIComponent(edited),
+      });
+      process.exit(0);
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+      timeout: 5000, stdio: 'pipe', env: { ...process.env, TERM_PROGRAM: terminal, TMUX: '' },
+    });
+  });
+}
+
 test('hover capture follows mouse dispatch after a font-size change', () => {
   const source = `
     import assert from 'node:assert/strict';
