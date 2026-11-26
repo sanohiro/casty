@@ -91,6 +91,61 @@ test('input preserves button holds, short drags, event ordering, and address-bar
   execFileSync(process.execPath, ['--input-type=module', '-e', source], { timeout: 5000, stdio: 'pipe' });
 });
 
+test('native confirms can be answered while page input is blocked', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import { EventEmitter } from 'node:events';
+    import { setImmediate as turn, setTimeout as delay } from 'node:timers/promises';
+    import { startInputHandling } from ${JSON.stringify(new URL('../lib/input.js', import.meta.url).href)};
+    let output = '';
+    process.stdout.write = value => { output += value; return true; };
+    process.stdin.setRawMode = () => {};
+    const client = new EventEmitter();
+    const answers = [], pageText = [];
+    let releasePress;
+    client.send = async (method, params) => {
+      if (method === 'Page.getNavigationHistory') return { entries: [], currentIndex: 0 };
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') {
+        await new Promise(resolve => { releasePress = resolve; });
+      }
+      if (method === 'Input.insertText') pageText.push(params.text);
+      if (method === 'Page.handleJavaScriptDialog') {
+        answers.push(params.accept);
+        client.emit('Page.javascriptDialogClosed');
+        releasePress();
+      }
+      return {};
+    };
+    const bar = startInputHandling(client, 10, 20, 1, {}, () => {}, () => {});
+    bar.setUrl('https://example.com/');
+    const input = str => process.stdin.emit('data', Buffer.from(str));
+    for (const [key, accept] of [['\\x1b', false], ['\\r', true]]) {
+      releasePress = undefined;
+      input('\\x1b[<0;10;5M');
+      await turn();
+      assert.equal(typeof releasePress, 'function');
+      output = '';
+      client.emit('Page.javascriptDialogOpening', {
+        type: 'confirm', message: 'Continue?\\n\\tCheck this \\x1b[2J',
+      });
+      assert.match(output, /\\[Enter\\] OK  \\[Esc\\] Cancel  Continue\\? Check this/);
+      assert.ok(!output.includes('\\x1b[2J'), 'terminal escape must be stripped');
+      input('ignored');
+      input(key);
+      await delay(80);
+      assert.equal(answers.at(-1), accept);
+      assert.match(output, /https:\\/\\/example\\.com\\//);
+    }
+    assert.deepEqual(answers, [false, true]);
+    assert.deepEqual(pageText, []);
+    input('allowed');
+    await turn();
+    assert.deepEqual(pageText, ['allowed']);
+    process.exit(0);
+  `;
+  execFileSync(process.execPath, ['--input-type=module', '-e', source], { timeout: 5000, stdio: 'pipe' });
+});
+
 for (const terminal of ['ghostty', 'kitty']) {
   test(`address editing preserves URLs and searches with split keys and scrolled clicks (${terminal})`, () => {
     const source = `
