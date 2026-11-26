@@ -9,11 +9,12 @@ process.stderr.on('error', () => {});
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { parseArgs } from '../lib/cli.js';
 import { findChrome } from '../lib/chrome.js';
-import { toURL } from '../lib/urlbar.js';
+import { TOOLBAR_ROWS, toURL } from '../lib/urlbar.js';
 
 let options;
 try { options = parseArgs(process.argv.slice(2)); }
@@ -43,6 +44,9 @@ Key bindings:
   Alt+C            Copy selected text
   Ctrl+V           Paste from clipboard
   Alt+Left/Right   Back / Forward
+  Alt+Home         Home page
+  Ctrl+T / Ctrl+W  Open / close tab
+  Alt+Up/Down      Previous / next tab
   Ctrl+Q           Quit
 
 Address bar:
@@ -77,6 +81,7 @@ if (!headlessShellPath && !process.env.CASTY_ENSURE_CHROME) {
 }
 
 import { startBrowser, setupPage, startScreencast, stopScreencast } from '../lib/browser.js';
+import { CDPClient } from '../lib/cdp.js';
 import { sendFrame, resetFrameCache, clearScreen, hideCursor, showCursor, cleanup as cleanupTmp, transport, selectCaptureFormat, setDisplaySize, disableDedup } from '../lib/kitty.js';
 import { enableMouse, disableMouse, mouseMode, mouseFormat, startInputHandling } from '../lib/input.js';
 import { loadKeyBindings } from '../lib/keys.js';
@@ -185,17 +190,25 @@ async function main() {
   const browser = await startBrowser(term.zoom, headlessShellPath);
   const media = mediaP ? await mediaP : null;
 
-  // Reserve line 1 for URL bar, use the rest for browser display
-  const barHeight = term.cellHeight;
-  const viewHeight = term.height - barHeight;
-  setDisplaySize(term.cols, term.rows - 1);
+  // Reserve a row each for the title, tabs, and navigation.
+  let currentTerm = term;
+  const pageRows = t => Math.max(1, t.rows - TOOLBAR_ROWS);
+  setDisplaySize(term.cols, pageRows(term), TOOLBAR_ROWS);
 
   // Phase 2: CDP connection + page setup
-  const { client, cssWidth, cssHeight } = await setupPage(browser, { ...term, height: viewHeight, mediaPort: media?.port || 0, mediaToken: media?.token || '' });
-  const chromeProcess = browser.proc;
-
-  // Log WebSocket errors to stderr (prevent unhandled crash)
-  client.on('error', (err) => { console.error('casty: CDP error:', err.message); });
+  const preparePage = (t, targetId) => setupPage(browser, {
+    ...t, height: pageRows(t) * t.cellHeight, nativeScale: term.zoom, targetId,
+    mediaPort: media?.port || 0, mediaToken: media?.token || '',
+  });
+  const first = await preparePage(term);
+  const { cssWidth, cssHeight } = first;
+  let client = first.client;
+  let activeId = first.targetId;
+  const tabs = new Map([[activeId, { id: activeId, client, url: 'about:blank' }]]);
+  const navigation = new EventEmitter();
+  const browserClient = new CDPClient();
+  browserClient.on('error', err => console.error('casty: browser CDP error:', err.message));
+  await browserClient.connect(browser.wsUrl);
 
   let renderPaused = false;
   const pauseRender = (p = true) => {
@@ -235,9 +248,6 @@ async function main() {
     onFrame,
   });
 
-  urlBar = startInputHandling(client, cssCellW, cssCellH, term.zoom, bindings, pauseRender, () => forceCapture());
-  urlBar.render();
-
   // Force capture on page load events (debounced — multiple events fire close together)
   let delayedTimers = [];
   function delayedCapture() {
@@ -248,17 +258,151 @@ async function main() {
       else delayedTimers.push(setTimeout(() => forceCapture(), ms));
     }
   }
-  client.on('Page.domContentEventFired', delayedCapture);
-  client.on('Page.loadEventFired', delayedCapture);
-  client.on('Page.frameNavigated', ({ frame }) => {
-    if (!frame.parentId) delayedCapture(); // Main frame only
+  let shuttingDown = false;
+  let viewTransition = Promise.resolve();
+  function changeView(work) {
+    viewTransition = viewTransition.then(() => {
+      if (!shuttingDown) return work();
+    }).catch(err => console.error('casty: view error:', err.message));
+    return viewTransition;
+  }
+
+  function publishTabs() {
+    navigation.emit('tabsChanged', [...tabs.values()], activeId);
+  }
+
+  async function readTabTitle(tab) {
+    const url = tab.url;
+    try {
+      const { result } = await tab.client.send('Runtime.evaluate', {
+        expression: 'document.title', returnByValue: true,
+      }, 1500);
+      if (tabs.has(tab.id) && tab.url === url && result.value && tab.title !== result.value) {
+        tab.title = result.value;
+        publishTabs();
+      }
+    } catch {}
+  }
+
+  function watchPage(tab) {
+    tab.client.on('error', err => console.error('casty: page CDP error:', err.message));
+    tab.client.on('Page.loadEventFired', () => void readTabTitle(tab));
+    for (const event of ['Page.domContentEventFired', 'Page.loadEventFired', 'Page.frameNavigated',
+      'Page.navigatedWithinDocument', 'Browser.downloadWillBegin', 'Browser.downloadProgress']) {
+      tab.client.on(event, data => {
+        if (tab.id === activeId) navigation.emit(event, data);
+      });
+    }
+  }
+
+  async function selectTab(id) {
+    const tab = tabs.get(id);
+    if (!tab || id === activeId) return;
+    const t = currentTerm;
+    const width = Math.round(t.width / t.zoom);
+    const height = Math.round(pageRows(t) * t.cellHeight / t.zoom);
+    if (!tab.client) {
+      const prepared = await preparePage(t, id);
+      if (!tabs.has(id) || shuttingDown) { prepared.client.close(); return; }
+      tab.client = prepared.client;
+      watchPage(tab);
+    } else {
+      await tab.client.setViewport({ width, height, zoom: t.zoom, nativeScale: term.zoom });
+    }
+    await browserClient.send('Target.activateTarget', { targetId: id });
+    if (!tabs.has(id) || shuttingDown) return;
+    for (const timer of delayedTimers) clearTimeout(timer);
+    delayedTimers = [];
+    const previous = tabs.get(activeId);
+    client = tab.client;
+    activeId = id;
+    if (previous) await stopScreencast(previous.client, screencastCleanup);
+    else screencastCleanup();
+    if (!tabs.has(id) || shuttingDown) return;
+    clearScreen();
+    const info = await client.send('Page.getFrameTree', {}, 1500).catch(() => null);
+    navigation.emit('tabSelected', info?.frameTree?.frame || { id, url: tab.url || 'about:blank' });
+    publishTabs();
+    ({ forceCapture, cleanup: screencastCleanup } = await startScreencast(client, {
+      width, height, format: screenshotFormat, onFrame,
+    }));
+    forceCapture();
+    void readTabTitle(tab);
+  }
+
+  const select = id => changeView(() => selectTab(id));
+  const tabActions = {
+    client: () => client,
+    select,
+    cycle: delta => changeView(() => {
+      const ids = [...tabs.keys()];
+      const index = ids.indexOf(activeId);
+      return selectTab(ids[(index + delta + ids.length) % ids.length]);
+    }),
+    open: () => changeView(async () => {
+      const { targetId } = await browserClient.send('Target.createTarget', { url: 'about:blank' });
+      tabs.set(targetId, { id: targetId, url: 'about:blank' });
+      await selectTab(targetId);
+      if (activeId === targetId) {
+        const homeUrl = toURL(config.homeUrl) || config.homeUrl;
+        await client.send('Page.navigate', { url: homeUrl });
+      }
+    }),
+    close: (id = activeId) => changeView(async () => {
+      if (!tabs.has(id)) return;
+      if (tabs.size === 1) return shutdown();
+      if (id === activeId) {
+        const ids = [...tabs.keys()];
+        const index = ids.indexOf(id);
+        await selectTab(ids[index + 1] || ids[index - 1]);
+      }
+      if (tabs.has(id)) await browserClient.send('Target.closeTarget', { targetId: id });
+    }),
+  };
+
+  urlBar = startInputHandling(navigation, cssCellW, cssCellH, term.zoom, bindings, pauseRender, () => forceCapture(), tabActions);
+  watchPage(tabs.get(activeId));
+  publishTabs();
+  navigation.on('Page.domContentEventFired', delayedCapture);
+  navigation.on('Page.loadEventFired', delayedCapture);
+  navigation.on('Page.frameNavigated', ({ frame }) => {
+    if (!frame.parentId) delayedCapture();
   });
-  client.on('Page.navigatedWithinDocument', delayedCapture);
+  navigation.on('Page.navigatedWithinDocument', delayedCapture);
+
+  browserClient.on('Target.targetCreated', ({ targetInfo }) => {
+    const { targetId: id, title, url, openerId } = targetInfo;
+    if (!tabs.has(openerId) || tabs.has(id)) return;
+    tabs.set(id, { id, title, url });
+    publishTabs();
+    void select(id);
+  });
+  browserClient.on('Target.targetInfoChanged', ({ targetInfo }) => {
+    const { targetId: id, title, url } = targetInfo;
+    const tab = tabs.get(id);
+    if (!tab) return;
+    const nextTitle = url === tab.url && title === url ? tab.title : title;
+    if (tab.title === nextTitle && tab.url === url) return;
+    Object.assign(tab, { title: nextTitle, url });
+    publishTabs();
+  });
+  browserClient.on('Target.targetDestroyed', ({ targetId }) => {
+    const tab = tabs.get(targetId);
+    if (!tab) return;
+    tabs.delete(targetId);
+    tab.client?.close();
+    if (shuttingDown) return;
+    publishTabs();
+    if (targetId === activeId) {
+      if (tabs.size) void select(tabs.keys().next().value);
+      else void shutdown();
+    }
+  });
+  await browserClient.send('Target.setDiscoverTargets', { discover: true, filter: [{ type: 'page' }] });
 
   // Fast local pages can finish loading before capture and input listeners exist.
   client.send('Page.navigate', { url }).catch(e => console.error('casty: navigate error:', e.message));
 
-  let shuttingDown = false;
   async function shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -267,10 +411,11 @@ async function main() {
     for (const timer of delayedTimers) clearTimeout(timer);
     try {
       await stopScreencast(client, screencastCleanup);  // Stop screencast (disables pending captures)
-      await client.send('Browser.close').catch(() => {});
+      await browserClient.send('Browser.close').catch(() => {});
     } catch {}
-    client.close();
-    chromeProcess.kill();
+    for (const tab of tabs.values()) tab.client?.close();
+    browserClient.close();
+    browser.proc.kill();
     await media?.cleanup();
     disableMouse();
     showCursor();
@@ -285,13 +430,11 @@ async function main() {
   process.on('SIGHUP', shutdown);
 
   // SIGWINCH: Follow resize + font size changes
-  // Debounced (150ms) + guarded with pending flag to catch late resizes
+  // Debounce bursts and serialize resizing with tab changes.
   let resizeTimer = null;
-  let resizing = false;
-  let pendingResize = false;
   process.on('SIGWINCH', () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(handleResize, 150);
+    resizeTimer = setTimeout(() => changeView(handleResize), 150);
   });
   // Direct screenshot — bypasses screencast's capturing flag
   const screenshotOpts = { format: screenshotFormat, optimizeForSpeed: true, captureBeyondViewport: false };
@@ -304,17 +447,16 @@ async function main() {
   }
 
   async function handleResize() {
-    if (resizing) { pendingResize = true; return; }
-    resizing = true;
     try {
       // Stop old screencast FIRST to prevent stale frames
       await stopScreencast(client, screencastCleanup);
 
       const t = await getTermInfo({ keepAlive: true });
-      const vh = t.height - t.cellHeight;
+      currentTerm = t;
+      const vh = pageRows(t) * t.cellHeight;
       const cw = Math.round(t.width / t.zoom);
       const ch = Math.round(vh / t.zoom);
-      setDisplaySize(t.cols, t.rows - 1);
+      setDisplaySize(t.cols, pageRows(t), TOOLBAR_ROWS);
       console.error(`casty: resize ${cw}x${ch} (dev:${t.width}x${vh}) cell:${t.cellWidth}x${t.cellHeight} size:${t.sizeSource} zoom:${t.zoom.toFixed(2)}`);
 
       clearScreen();
@@ -360,11 +502,6 @@ async function main() {
       }));
     } catch (err) {
       console.error('casty: resize error:', err.message);
-    }
-    resizing = false;
-    if (pendingResize) {
-      pendingResize = false;
-      handleResize();
     }
   }
 }
