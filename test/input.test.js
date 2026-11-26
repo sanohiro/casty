@@ -28,7 +28,8 @@ test('tab and navigation rows act on the browser without forwarding toolbar clic
     import { startInputHandling } from ${JSON.stringify(new URL('../lib/input.js', import.meta.url).href)};
     import { loadKeyBindings } from ${JSON.stringify(new URL('../lib/keys.js', import.meta.url).href)};
     import { loadConfig } from ${JSON.stringify(new URL('../lib/config.js', import.meta.url).href)};
-    process.stdout.write = () => true;
+    let output = '';
+    process.stdout.write = value => { output += value; return true; };
     process.stdout.columns = 80;
     process.stdin.setRawMode = () => {};
     let currentIndex = 0;
@@ -38,31 +39,35 @@ test('tab and navigation rows act on the browser without forwarding toolbar clic
         return { currentIndex, entries: [{ id: 10, url: 'https://example.org' }, { id: 11 }] };
       }
       calls.push({ method, ...params });
+      if (params?.text === 'stalled') return new Promise(() => {});
       return {};
     };
     const tabs = {
       client: () => events, select: id => actions.push(id),
-      open: () => actions.push('open'), close: () => actions.push('close'),
+      open: () => actions.push('open'), close: id => actions.push(['close', id]),
     };
     loadConfig().homeUrl = 'https://home.example/';
     const bar = startInputHandling(events, 10, 20, 1, loadKeyBindings(), () => {}, () => {}, tabs);
     events.emit('tabsChanged', [{ id: 'first', title: 'First' }, { id: 'second', title: 'Second' }], 'first');
+    assert.ok(output.includes('\\x1b[1;1H') && output.includes('Casty — First'));
+    assert.ok(output.includes('\\x1b[2;1H') && output.includes('[x] * First') && output.includes('[x]   Second'));
+    assert.ok(output.includes('\\x1b[3;1H') && output.includes('[←] [→] [⌂]'));
     const input = str => process.stdin.emit('data', Buffer.from(str));
     const click = async (col, row) => {
       input('\\x1b[<0;' + col + ';' + row + 'M\\x1b[<0;' + col + ';' + row + 'm');
       await turn();
     };
-    await click(28, 1);
-    await click(2, 1);
-    await click(6, 1);
-    assert.deepEqual(actions, ['second', 'open', 'close']);
+    await click(30, 2);
+    await click(2, 2);
+    await click(26, 2);
+    assert.deepEqual(actions, ['second', 'open', ['close', 'second']]);
     assert.deepEqual(calls, []);
-    await click(2, 2);
+    await click(2, 3);
     assert.deepEqual(calls, [], 'back at the start does nothing');
-    await click(6, 2);
+    await click(6, 3);
     currentIndex = 1;
-    await click(2, 2);
-    await click(10, 2);
+    await click(2, 3);
+    await click(10, 3);
     input('\\x1b[1;3H');
     await turn();
     assert.deepEqual(calls, [
@@ -71,12 +76,21 @@ test('tab and navigation rows act on the browser without forwarding toolbar clic
       { method: 'Page.navigate', url: 'https://home.example/' },
       { method: 'Page.navigate', url: 'https://home.example/' },
     ]);
-    await click(28, 2);
+    await click(28, 3);
     assert.equal(bar.editing, true);
-    await click(4, 3);
+    await click(4, 4);
     assert.equal(bar.editing, false);
     const pointer = calls.filter(call => call.method === 'Input.dispatchMouseEvent');
     assert.deepEqual(pointer.map(({ type, y }) => [type, y]), [['mousePressed', 10], ['mouseReleased', 10]]);
+    let quit = false;
+    process.on('SIGINT', () => { quit = true; });
+    input('stalled');
+    await turn();
+    assert.equal(calls.at(-1).text, 'stalled');
+    await click(77, 1);
+    assert.equal(quit, false);
+    await click(78, 1);
+    assert.equal(quit, true, 'the top-right close must bypass stalled browser input');
     process.exit(0);
   `;
   execFileSync(process.execPath, ['--input-type=module', '-e', source], {

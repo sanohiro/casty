@@ -118,9 +118,10 @@ Customizable via `~/.casty/keys.json`.
 
 **Alt+L** to open. Type a URL or search query. `/b query` searches bookmarks.
 
-Click a tab in the first row to select it. Use [+] to open a tab and [×] to close
-the selected tab. The second row has Back, Forward, Home, and the address.
-Links that open a new tab select it automatically.
+The first row shows the page title and an [x] button to quit. Click a tab in the
+second row to select it, use [+] to open a tab, or click a tab's [x] to close it.
+The active tab is marked with an asterisk. The third row has Back, Forward,
+Home, and the address. Links that open a new tab select it automatically.
 
 ### Bookmarks
 

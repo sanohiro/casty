@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { parseArgs } from '../lib/cli.js';
 import { findChrome } from '../lib/chrome.js';
-import { toURL } from '../lib/urlbar.js';
+import { TOOLBAR_ROWS, toURL } from '../lib/urlbar.js';
 
 let options;
 try { options = parseArgs(process.argv.slice(2)); }
@@ -97,7 +97,6 @@ const TERM_PIXEL_FALLBACK_DELAY = 100;
 
 // Delayed capture timings after page navigation (ms)
 const DELAYED_CAPTURE_MS = [0, 300, 1000];
-const TOOLBAR_ROWS = 2;
 
 // Reference cell size (96 DPI, standard terminal font)
 // Larger cells → zoom in, smaller cells → zoom out
@@ -191,7 +190,7 @@ async function main() {
   const browser = await startBrowser(term.zoom, headlessShellPath);
   const media = mediaP ? await mediaP : null;
 
-  // Reserve one row each for tabs and navigation.
+  // Reserve a row each for the title, tabs, and navigation.
   let currentTerm = term;
   const pageRows = t => Math.max(1, t.rows - TOOLBAR_ROWS);
   setDisplaySize(term.cols, pageRows(term), TOOLBAR_ROWS);
@@ -349,13 +348,15 @@ async function main() {
         await client.send('Page.navigate', { url: homeUrl });
       }
     }),
-    close: () => changeView(async () => {
+    close: (id = activeId) => changeView(async () => {
+      if (!tabs.has(id)) return;
       if (tabs.size === 1) return shutdown();
-      const previous = activeId;
-      const ids = [...tabs.keys()];
-      const index = ids.indexOf(previous);
-      await selectTab(ids[index + 1] || ids[index - 1]);
-      if (tabs.has(previous)) await browserClient.send('Target.closeTarget', { targetId: previous });
+      if (id === activeId) {
+        const ids = [...tabs.keys()];
+        const index = ids.indexOf(id);
+        await selectTab(ids[index + 1] || ids[index - 1]);
+      }
+      if (tabs.has(id)) await browserClient.send('Target.closeTarget', { targetId: id });
     }),
   };
 
