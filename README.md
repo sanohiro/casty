@@ -101,6 +101,9 @@ casty   # opens home page
 | Alt+L | Address bar |
 | Alt+F | Hint mode (Vimium-style) |
 | Alt+Left / Right | Back / Forward |
+| Alt+Home | Home page |
+| Ctrl+T / Ctrl+W | Open / close tab |
+| Alt+Up / Down | Previous / next tab |
 | Alt+C | Copy selected text |
 | Ctrl+V | Paste |
 | Ctrl+Q | Quit |
@@ -114,6 +117,10 @@ Customizable via `~/.casty/keys.json`.
 ### Address Bar
 
 **Alt+L** to open. Type a URL or search query. `/b query` searches bookmarks.
+
+Click a tab in the first row to select it. Use [+] to open a tab and [×] to close
+the selected tab. The second row has Back, Forward, Home, and the address.
+Links that open a new tab select it automatically.
 
 ### Bookmarks
 

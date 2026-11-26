@@ -20,6 +20,70 @@ test('local addresses use HTTP while host ports and explicit schemes are preserv
   assert.equal(toURL('file:///tmp/page.html'), 'file:///tmp/page.html');
 });
 
+test('tab and navigation rows act on the browser without forwarding toolbar clicks', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import { EventEmitter } from 'node:events';
+    import { setImmediate as turn } from 'node:timers/promises';
+    import { startInputHandling } from ${JSON.stringify(new URL('../lib/input.js', import.meta.url).href)};
+    import { loadKeyBindings } from ${JSON.stringify(new URL('../lib/keys.js', import.meta.url).href)};
+    import { loadConfig } from ${JSON.stringify(new URL('../lib/config.js', import.meta.url).href)};
+    process.stdout.write = () => true;
+    process.stdout.columns = 80;
+    process.stdin.setRawMode = () => {};
+    let currentIndex = 0;
+    const events = new EventEmitter(), calls = [], actions = [];
+    events.send = async (method, params) => {
+      if (method === 'Page.getNavigationHistory') {
+        return { currentIndex, entries: [{ id: 10, url: 'https://example.org' }, { id: 11 }] };
+      }
+      calls.push({ method, ...params });
+      return {};
+    };
+    const tabs = {
+      client: () => events, select: id => actions.push(id),
+      open: () => actions.push('open'), close: () => actions.push('close'),
+    };
+    loadConfig().homeUrl = 'https://home.example/';
+    const bar = startInputHandling(events, 10, 20, 1, loadKeyBindings(), () => {}, () => {}, tabs);
+    events.emit('tabsChanged', [{ id: 'first', title: 'First' }, { id: 'second', title: 'Second' }], 'first');
+    const input = str => process.stdin.emit('data', Buffer.from(str));
+    const click = async (col, row) => {
+      input('\\x1b[<0;' + col + ';' + row + 'M\\x1b[<0;' + col + ';' + row + 'm');
+      await turn();
+    };
+    await click(28, 1);
+    await click(2, 1);
+    await click(6, 1);
+    assert.deepEqual(actions, ['second', 'open', 'close']);
+    assert.deepEqual(calls, []);
+    await click(2, 2);
+    assert.deepEqual(calls, [], 'back at the start does nothing');
+    await click(6, 2);
+    currentIndex = 1;
+    await click(2, 2);
+    await click(10, 2);
+    input('\\x1b[1;3H');
+    await turn();
+    assert.deepEqual(calls, [
+      { method: 'Page.navigateToHistoryEntry', entryId: 11 },
+      { method: 'Page.navigateToHistoryEntry', entryId: 10 },
+      { method: 'Page.navigate', url: 'https://home.example/' },
+      { method: 'Page.navigate', url: 'https://home.example/' },
+    ]);
+    await click(28, 2);
+    assert.equal(bar.editing, true);
+    await click(4, 3);
+    assert.equal(bar.editing, false);
+    const pointer = calls.filter(call => call.method === 'Input.dispatchMouseEvent');
+    assert.deepEqual(pointer.map(({ type, y }) => [type, y]), [['mousePressed', 10], ['mouseReleased', 10]]);
+    process.exit(0);
+  `;
+  execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+    timeout: 5000, stdio: 'pipe', env: { ...process.env, TERM_PROGRAM: 'kitty', TMUX: '' },
+  });
+});
+
 test('hover tracking does not depend on terminal identity or tmux', () => {
   const source = `
     import assert from 'node:assert/strict';
